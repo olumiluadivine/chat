@@ -1,0 +1,53 @@
+use async_std::io::BufReader;
+use async_std::net::TcpStream;
+use async_std::prelude::*;
+use async_std::sync::{Arc, Mutex};
+use chat::util::{self, ChatResult};
+use chat::{Client, Server};
+
+use crate::chat_map::ChatTracker;
+
+pub async fn handle(socket: TcpStream, chats: Arc<ChatTracker>) -> ChatResult<()> {
+    let leaving: Arc<Leaving> = Arc::new(Leaving::new(socket.clone()));
+    let buffered: BufReader<TcpStream> = BufReader::new(socket);
+    let mut from_client = util::receive(buffered);
+
+    while let Some(req_res) = from_client.next().await {
+        let request: Client = req_res?;
+
+        let result: Result<(), String> = match request {
+            Client::Join { chat_name } => {
+                let chat = chats.find_or_new(chat_name);
+                chat.join(leaving.clone());
+                Ok(())
+            }
+            Client::Post { chat_name, message } => match chats.find(&chat_name) {
+                Some(chat) => {
+                    chat.post(message);
+                    Ok(())
+                }
+                None => Err(format!("Chat does not exist: {}", chat_name)),
+            },
+        };
+        if let Err(message) = result {
+            let report: Server = Server::Error(message);
+            leaving.send(report).await?;
+        }
+    }
+    Ok(())
+}
+
+pub struct Leaving(Mutex<TcpStream>);
+
+impl Leaving {
+    pub fn new(client: TcpStream) -> Leaving {
+        Leaving(Mutex::new(client))
+    }
+
+    pub async fn send(&self, packet: Server) -> ChatResult<()> {
+        let mut lock = self.0.lock().await;
+        util::send_json(&mut *lock, &packet).await?;
+        lock.flush().await?;
+        Ok(())
+    }
+}
